@@ -1,8 +1,15 @@
 import LRU from 'lru-cache';
-import { evaluate } from 'mathjs';
-import { performance } from 'perf_hooks';
-import { Range, Selection, TextEditor } from 'vscode';
+import * as math from 'mathjs';
+import { Range, Selection, Position, TextEditor } from 'vscode';
 import { Evaluation } from './types';
+
+type Zip<T extends unknown[][]> = {
+  [I in keyof T]: T[I] extends (infer U)[] ? U : never;
+};
+const zip = <T extends unknown[][]>(...arrays: T): Zip<T>[] => {
+  const length = Math.min(...arrays.map(a => a.length));
+  return Array.from({ length }, (_, i) => arrays.map(a => a[i]) as Zip<T>);
+};
 
 type EvaluationResult = {
   source: string;
@@ -14,95 +21,82 @@ type EvaluationResult = {
  * Cache will contain:
  *  - [Entire line's text as string, { source: subselection, result } ]
  */
-const resultCache = new LRU<string, EvaluationResult>({
+const resultCache = new LRU<readonly string[], readonly Evaluation[]>({
   max: 300,
 });
 
-/**
- * Cache will contain:
- *  - [Subselection, result]
- */
-const subselectionCache = new LRU<string, string | null>({
-  max: 600,
-});
+export function getEvaluations(editor: TextEditor): readonly Evaluation[] {
+  const parser = math.parser();
+  const selections = splitSelectionsToLines(editor, editor.selections)
+    .map(selection => selection.isEmpty ? editor.document.lineAt(selection.end.line).range : selection);
+  selections.sort((lhs, rhs) => lhs.start.line - rhs.start.line); //ensures that if we select things in reverse order, things still evaluate in line order
 
-export function getEvaluations(editor: TextEditor): Evaluation[] {
-  const evaluations: Evaluation[] = [];
-
-  for (const selection of editor.selections) {
-    const evaluation = getEvaluation(editor, selection);
-
-    if (evaluation) {
-      evaluations.push(evaluation);
-    }
+  const selectionsText = selections.map(range => editor.document.getText(range).trim());
+  if (resultCache.has(selectionsText)) {
+    return resultCache.get(selectionsText)!;
   }
 
+  const evaluations: Evaluation[] = [];
+  for (const [range, text] of zip(selections, selectionsText)) {
+    const { result, source, desirable } = getEvaluation(text, parser);
+    if (!desirable) { continue; };
+
+    evaluations.push({
+      result,
+      source,
+      range,
+    });
+  }
+
+  resultCache.set(selectionsText, evaluations);
   return evaluations;
 }
 
-function getEvaluation(editor: TextEditor, selection: Selection) {
-  const start = selection.isReversed ? selection.active : selection.anchor;
-  const end = selection.isReversed ? selection.anchor : selection.active;
-  const line = editor.document.lineAt(end.line).range;
+function splitSelectionsToLines(editor: TextEditor, selections: readonly Selection[]): Selection[] {
+  const result: Selection[] = [];
 
-  const range: Range = selection.isEmpty ? line : selection;
-  const text = editor.document.getText(range).replace(/([\r\n]|  )+(\/\/\s)?/g, ' ');
+  for (const selection of selections) {
+    if (selection.start.line === selection.end.line) {
+      // Single-line: keep as-is
+      result.push(selection);
+    } else {
+      // First line: from original start to end of start line
+      result.push(
+        new Selection(
+          selection.start,
+          editor.document.lineAt(selection.start.line).range.end
+        )
+      );
 
-  if (text.length < 3) {
-    return undefined;
+      // Middle lines
+      for (let line = selection.start.line + 1; line < selection.end.line; line++) {
+        const range = editor.document.lineAt(line).range;
+        result.push(new Selection(range.start, range.end));
+      }
+
+      // Last line: from column 0 to original end
+      result.push(new Selection(new Position(selection.end.line, 0), selection.end));
+    }
   }
 
-  let res: EvaluationResult = {} as EvaluationResult;
-  if (resultCache.has(text)) {
-    res = resultCache.get(text)!;
-  } else {
-    res = getResult(text);
-    resultCache.set(text, res);
-  }
-
-  const { result, source, desirable } = res;
-
-  if (desirable) {
-    const evaluation: Evaluation = {
-      result,
-      source,
-      range: new Range(start, line.end),
-    };
-
-    return evaluation;
-  }
-
-  return undefined;
+  return result;
 }
 
-function getResult(text: string): EvaluationResult {
-  // generateSubselections provide subsets in size order, so we always get the largest subSelection
+function getEvaluation(text: string, parser: math.Parser): EvaluationResult {
   for (const subSelection of generateSubselections(text)) {
     const source = subSelection.join(' ').trim();
-    if (subselectionCache.has(source)) {
-      const result = subselectionCache.get(source);
+    try {
+      // If the string is not calculable, this will throw
+      const raw = parser.evaluate(source);
 
-      if (result) {
-        return { result, source, desirable: isDesirableResult(source, result) };
-      } else {
-        return {} as EvaluationResult;
-      }
-    } else {
-      try {
-        // If the string is not calculable, this will throw
-        const raw = evaluate(source);
+      // So here, we have a result
+      const result = raw.toString();
 
-        // So here, we have a result
-        const result = raw.toString();
-        subselectionCache.set(source, result);
-
-        // Include `desirable` prop here so it is also cached - otherwise could simply add a check to parent function
-        return { result, source, desirable: isDesirableResult(source, result) };
-      } catch (_) {
-        // Error during evaluation - expected.
-        // In this case, do not return - try the next subSelection
-        subselectionCache.set(source, null);
-      }
+      // Include `desirable` prop here so it is also cached - otherwise could simply add a check to parent function
+      return { result, source, desirable: isDesirableResult(source, result) };
+    } catch (_) {
+      // Error during evaluation - expected.
+      // In this case, do not return - try the next subSelection
     }
   }
 
@@ -120,6 +114,7 @@ function isDesirableResult(source: string, result: string | undefined): result i
   );
 }
 
+// provides subsets in size order
 function* generateSubselections(text: string) {
   const parts = text.split(' ');
 
